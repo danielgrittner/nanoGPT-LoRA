@@ -56,7 +56,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 
 # LoRA params
-lora_rank = 0
+lora_rank = 8
 lora_alpha = 0.0 # set alpha to the first rank which is tried, then keep it fixed, and don't further tune it (see the paper for more info)
 lora_dropout = 0.0
 compute_grad_memory = False # compute the memory usage of the gradients
@@ -109,7 +109,7 @@ torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.float16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
@@ -189,6 +189,7 @@ elif init_from == 'resume':
         # Only make LoRA weights tunable
         print("Marking model as LoRA fine-tunable...")
         model = get_lora_model(model)
+        print(f"Total NUmber of Trainable Parameters:",sum(p.numel() for p in model.parameters() if p.requires_grad))
         print("Done.")
 
 elif init_from.startswith('gpt2'):
