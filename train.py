@@ -103,7 +103,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+block_size = 512
 # model
 n_layer = 12
 n_head = 12
@@ -237,15 +237,17 @@ def get_batch(split):
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
+train_batch_generator = get_batch("train")
+test_batch_generator = get_batch("test")
 
 # attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+# meta_path = os.path.join(data_dir, 'meta.pkl')
+# meta_vocab_size = None
+# if os.path.exists(meta_path):
+#     with open(meta_path, 'rb') as f:
+#         meta = pickle.load(f)
+#     meta_vocab_size = meta['vocab_size']
+#     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
 # Note: we only want to do LoRA fine-tuning when we resume or start with a pretrained model and NOT when we start from scratch
@@ -351,11 +353,19 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                _, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+            if(split=="train"):
+
+              X, Y = next(train_batch_generator)
+              with ctx:
+                  # breakpoint()
+                  _, loss = model(X, Y)
+              losses[k] = loss.item()
+            else:
+              X, Y = next(test_batch_generator)
+              with ctx:
+                  _, loss = model(X, Y)
+              losses[k] = loss.item()
+            out[split] = losses.mean()
     model.train()
     return out
 
@@ -377,9 +387,9 @@ def get_lr(it):
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
-
+# breakpoint()
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y = next(train_batch_generator) # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -431,7 +441,7 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y = next(train_batch_generator)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
