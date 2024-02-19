@@ -29,6 +29,62 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, get_lora_model
 
+from datasets import Dataset
+from transformers import AutoTokenizer, DataCollatorWithPadding
+from torch.utils.data import DataLoader
+import torch
+from datasets import Dataset, load_dataset, disable_caching
+from model import GPTConfig, GPT
+
+from datasets import Dataset
+from transformers import AutoTokenizer, DataCollatorWithPadding
+from torch.utils.data import DataLoader
+import torch
+from datasets import Dataset, load_dataset, disable_caching
+from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
+import torch
+from torch.utils.data import Dataset
+
+class CustomDataLoader:
+    def __init__(self, dataset, tokenizer, batch_size=8):
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size
+        self.data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, return_tensors="pt", padding="max_length", max_length=512)
+        
+        # Format dataset with prompts and answers
+        formatted_dataset = dataset.map(self._add_text, remove_columns=dataset.column_names)
+        
+        print(f"{formatted_dataset=}")
+        # Tokenize the formatted text
+        self.processed_dataset = formatted_dataset.map(self._tokenize, batched=True)
+        # breakpoint()
+        print(f"{self.processed_dataset=}")
+        self.processed_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+        print(f"{self.processed_dataset=}")
+
+    def _add_text(self, rec):
+        prompt_template = "Below is a text that may have positive or negative sentiment. Predict sentiment. Instruction: {instruction}\n Response:"
+        answer_template = "{response}"
+
+        instruction = rec["sentence"]  # Assuming 'sentence' holds the instruction text
+        if rec["label"]==0 or rec["label"]=="0":
+          response = "negative"
+        else:
+          response = "positive"
+        # response = "positive" if rec["label"] == 1 else "negative"  # Example for binary classification
+
+        rec["text"] = prompt_template.format(instruction=instruction) + answer_template.format(response=response)
+        rec["labels"] = rec["label"]  # Ensure labels are correctly assigned
+        return rec
+
+    def _tokenize(self, examples):
+        return self.tokenizer(examples["text"], truncation=True, padding=False, max_length = 512)  # Dynamic padding will be applied later
+
+    def get_loader(self, shuffle=True):
+        return DataLoader(self.processed_dataset, batch_size=self.batch_size, shuffle=shuffle, collate_fn=self.data_collator)
+
+
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -112,21 +168,71 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.float16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
-data_dir = os.path.join('data', dataset)
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+# DATA LOADING
+
+model_id = "openai-community/gpt2"
+dataset = load_dataset("sst2" , split = 'train')
+small_dataset = dataset.select([i for i in range(128)])
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+split_data = small_dataset.train_test_split(test_size=14, seed=0)
+if tokenizer.pad_token is None:
+    tokenizer.add_special_tokens({'pad_token': '[EOS]'})
+
+# Instantiate CustomDataLoader
+custom_loader_train = CustomDataLoader(split_data["train"], tokenizer, batch_size=8)
+custom_loader_test = CustomDataLoader(split_data["test"], tokenizer, batch_size=8)
+
+
+# Get DataLoader
+train_loader = custom_loader_train.get_loader(shuffle=True)
+test_loader = custom_loader_test.get_loader(shuffle=True)
+
+# data_dir = os.path.join('data', dataset)
+# train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+# val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+# def get_batch(split):
+#     data = train_data if split == 'train' else val_data
+#     ix = torch.randint(len(data) - block_size, (batch_size,))
+#     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+#     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+#     if device_type == 'cuda':
+#         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+#         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+#     else:
+#         x, y = x.to(device), y.to(device)
+#     return x, y
+
 def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+  
+    if split == "train":
+
+      while True:
+          for batch in train_loader:
+              # Assuming your batch contains 'input_ids', 'attention_mask', and 'labels'
+              # Adjust the keys based on your actual batch structure
+              input_ids = batch['input_ids'].to(device)
+              attention_mask = batch['attention_mask'].to(device)
+              labels = batch['labels'].to(device)
+
+              yield input_ids, labels
+          # Optionally, restart the iteration over the dataset
+          # Remove or modify this part depending on whether you want to iterate indefinitely
+          train_loader.dataset.set_epoch(train_loader.epoch + 1)  #
+    elif split == "test":
+
+      while True:
+          for batch in test_loader:
+              # Assuming your batch contains 'input_ids', 'attention_mask', and 'labels'
+              # Adjust the keys based on your actual batch structure
+              input_ids = batch['input_ids'].to(device)
+              attention_mask = batch['attention_mask'].to(device)
+              labels = batch['labels'].to(device)
+
+              yield input_ids, labels
+          # Optionally, restart the iteration over the dataset
+          # Remove or modify this part depending on whether you want to iterate indefinitely
+          test_loader.dataset.set_epoch(test_loader.epoch + 1)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -279,7 +385,6 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
-
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
