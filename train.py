@@ -177,11 +177,11 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 split_data = small_dataset.train_test_split(test_size=14, seed=0)
 if tokenizer.pad_token is None:
-    tokenizer.add_special_tokens({'pad_token': '[EOS]'})
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
 # Instantiate CustomDataLoader
-custom_loader_train = CustomDataLoader(split_data["train"], tokenizer, batch_size=8)
-custom_loader_test = CustomDataLoader(split_data["test"], tokenizer, batch_size=8)
+custom_loader_train = CustomDataLoader(split_data["train"], tokenizer, batch_size)
+custom_loader_test = CustomDataLoader(split_data["test"], tokenizer, batch_size)
 
 
 # Get DataLoader
