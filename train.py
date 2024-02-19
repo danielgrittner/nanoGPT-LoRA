@@ -35,6 +35,7 @@ from torch.utils.data import DataLoader
 import torch
 from datasets import Dataset, load_dataset, disable_caching
 from model import GPTConfig, GPT
+from torch.nn.utils.rnn import pad_sequence
 
 from datasets import Dataset
 from transformers import AutoTokenizer, DataCollatorWithPadding
@@ -49,18 +50,17 @@ class CustomDataLoader:
     def __init__(self, dataset, tokenizer, batch_size=8):
         self.tokenizer = tokenizer
         self.batch_size = batch_size
-        self.data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, return_tensors="pt", padding="max_length", max_length=512)
+        self.data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer, return_tensors="pt", padding="max_length", max_length=1024)
         
         # Format dataset with prompts and answers
-        formatted_dataset = dataset.map(self._add_text, remove_columns=dataset.column_names)
+        self.formatted_dataset = dataset.map(self._add_text, remove_columns=dataset.column_names)
         
-        print(f"{formatted_dataset=}")
+        print(f"{self.formatted_dataset=}")
         # Tokenize the formatted text
-        self.processed_dataset = formatted_dataset.map(self._tokenize, batched=True)
+        # self.processed_dataset = formatted_dataset.map(self._tokenize_and_shift, batched=True)
         # breakpoint()
-        print(f"{self.processed_dataset=}")
-        self.processed_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
-        print(f"{self.processed_dataset=}")
+        self.formatted_dataset.set_format(type='torch', columns=['text','labels'])
+        print(f"{self.formatted_dataset=}")
 
     def _add_text(self, rec):
         prompt_template = "Below is a text that may have positive or negative sentiment. Predict sentiment. Instruction: {instruction}\n Response:"
@@ -78,10 +78,26 @@ class CustomDataLoader:
         return rec
 
     def _tokenize(self, examples):
-        return self.tokenizer(examples["text"], truncation=True, padding=False, max_length = 512)  # Dynamic padding will be applied later
+        return self.tokenizer(examples["text"], truncation=True, padding=True, max_length = 1024)  # Dynamic padding will be applied later
 
+    def collate_fn(self, batch):
+        # Extract texts from the batch
+        texts = [item['text'] for item in batch]
+        
+        # Tokenize all texts in the batch
+        tokenized_batch = self.tokenizer(texts, truncation=True, padding=True, 
+                                         max_length=1024, return_tensors='pt')
+        
+        # Prepare labels: shift right, pad and append EOS token ID
+        input_ids = tokenized_batch['input_ids']
+        labels = input_ids[:, 1:].clone() # Shift right
+        labels = torch.cat([labels, torch.full((labels.size(0), 1), self.tokenizer.pad_token_id, dtype=torch.long)], dim=1) # Append EOS
+        input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        labels_padded = pad_sequence(labels, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        # breakpoint()
+        return {"input_ids": input_ids_padded, "labels": labels_padded}
     def get_loader(self, shuffle=True):
-        return DataLoader(self.processed_dataset, batch_size=self.batch_size, shuffle=shuffle, collate_fn=self.data_collator)
+        return DataLoader(self.formatted_dataset, batch_size=self.batch_size, shuffle=shuffle, collate_fn=self.collate_fn)
 
 
 
@@ -102,8 +118,8 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 512
+batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 1024
 # model
 n_layer = 12
 n_head = 12
@@ -132,7 +148,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
@@ -177,6 +193,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 split_data = small_dataset.train_test_split(test_size=14, seed=0)
 if tokenizer.pad_token is None:
+    # tokenizer.add_special_tokens({'pad_token': '[EOS]'})
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
 # Instantiate CustomDataLoader
@@ -212,13 +229,12 @@ def get_batch(split):
               # Assuming your batch contains 'input_ids', 'attention_mask', and 'labels'
               # Adjust the keys based on your actual batch structure
               input_ids = batch['input_ids'].to(device)
-              attention_mask = batch['attention_mask'].to(device)
               labels = batch['labels'].to(device)
 
               yield input_ids, labels
           # Optionally, restart the iteration over the dataset
           # Remove or modify this part depending on whether you want to iterate indefinitely
-          train_loader.dataset.set_epoch(train_loader.epoch + 1)  #
+  
     elif split == "test":
 
       while True:
@@ -226,13 +242,12 @@ def get_batch(split):
               # Assuming your batch contains 'input_ids', 'attention_mask', and 'labels'
               # Adjust the keys based on your actual batch structure
               input_ids = batch['input_ids'].to(device)
-              attention_mask = batch['attention_mask'].to(device)
               labels = batch['labels'].to(device)
 
               yield input_ids, labels
           # Optionally, restart the iteration over the dataset
           # Remove or modify this part depending on whether you want to iterate indefinitely
-          test_loader.dataset.set_epoch(test_loader.epoch + 1)
+         
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -252,7 +267,7 @@ test_batch_generator = get_batch("test")
 # model init
 # Note: we only want to do LoRA fine-tuning when we resume or start with a pretrained model and NOT when we start from scratch
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=5034, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -261,6 +276,7 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
+
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
@@ -313,7 +329,7 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'lora_rank', 'lora_alpha']:
         model_args[k] = getattr(model.config, k)
-    
+    # model_args["vocab_size"] = 50304
     if lora_rank > 0:
         # Only make LoRA weights tunable
         print("Marking model as LoRA fine-tunable...")
@@ -356,6 +372,7 @@ def estimate_loss():
             if(split=="train"):
 
               X, Y = next(train_batch_generator)
+
               with ctx:
                   # breakpoint()
                   _, loss = model(X, Y)
@@ -390,6 +407,7 @@ if wandb_log and master_process:
 # breakpoint()
 # training loop
 X, Y = next(train_batch_generator) # fetch the very first batch
+
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
